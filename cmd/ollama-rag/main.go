@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -27,9 +30,35 @@ var (
 	TRUE  = true
 )
 
+// System instructions used across all modes
+const SYSTEM_INSTRUCTIONS = `You are a helpful assistant.
+You offer stock and option trading advice.
+You are a financial advisor, and offer stock and options trading advice.
+Respond with specific trading recommendations when asked.
+You specialize in the wheel strategy and options trading.`
+
 func main() {
+	// Parse command-line flags
+	interactive := flag.Bool("interactive", false, "Run in interactive chat mode")
+	flag.Parse()
+
 	ctx := context.Background()
 
+	// Set up Ollama client
+	client := setupOllamaClient()
+
+	// Load and prepare knowledge base
+	vectorStore := setupKnowledgeBase(ctx, client)
+
+	if *interactive {
+		runInteractiveMode(ctx, client, vectorStore)
+	} else {
+		runSingleQuestionMode(ctx, client, vectorStore)
+	}
+}
+
+// setupOllamaClient configures and tests the Ollama API client
+func setupOllamaClient() *api.Client {
 	var ollamaRawUrl string
 	if ollamaRawUrl = os.Getenv("OLLAMA_HOST"); ollamaRawUrl == "" {
 		ollamaRawUrl = "http://localhost:11434"
@@ -62,26 +91,21 @@ func main() {
 		fmt.Println("✅ Successfully connected to Ollama server")
 	}
 
-	systemInstructions := `You are a helpful assistant.
-	  You offer stock and option trading advice.
-		Respond with a specific option to trade
-		`
+	return client
+}
 
-	question := `based on the AAPL option chain, which option should I sell to open?
-	I want to start the wheel strategy.
-	I do not have any positions on AAPL.
-	`
-
+// setupKnowledgeBase loads and embeds the content for RAG
+func setupKnowledgeBase(ctx context.Context, client *api.Client) []VectorRecord {
 	contentBytes, err := os.ReadFile("../../content/stonks.md")
 	if err != nil {
 		logError(err)
 	}
-	context := string(contentBytes)
-	fmt.Printf("📄 Content size: %d bytes\n", len(context))
+	content := string(contentBytes)
+	fmt.Printf("📄 Content size: %d bytes\n", len(content))
 
 	// Use smaller chunks with less overlap to prevent embedding issues
 	// Maximum recommended size for embedding is around 512 tokens (roughly 2048 chars)
-	chunks := ChunkText(context, 400, 50)
+	chunks := ChunkText(content, 400, 50)
 	fmt.Printf("🧩 Split content into %d chunks\n", len(chunks))
 
 	vectorStore := []VectorRecord{}
@@ -103,54 +127,140 @@ func main() {
 		vectorStore = append(vectorStore, record)
 	}
 
+	return vectorStore
+}
+
+// runSingleQuestionMode processes a single predefined question
+func runSingleQuestionMode(ctx context.Context, client *api.Client, vectorStore []VectorRecord) {
+	question := `based on the AAPL option chain, which option should I sell to open?
+	I want to start the wheel strategy.
+	I do not have any positions on AAPL.
+	`
+
+	// Process the question with RAG
+	processRagQuestion(ctx, client, vectorStore, SYSTEM_INSTRUCTIONS, question)
+}
+
+// runInteractiveMode runs an interactive chat session
+func runInteractiveMode(ctx context.Context, client *api.Client, vectorStore []VectorRecord) {
+	reader := bufio.NewReader(os.Stdin)
+	chatHistory := []api.Message{
+		{Role: "system", Content: SYSTEM_INSTRUCTIONS},
+	}
+
+	fmt.Println("\n🤖 Welcome to the interactive RAG chat mode!")
+	fmt.Println("📊 Ask me any questions about stocks and options trading.")
+	fmt.Println("💡 Type 'exit' or 'quit' to end the session.")
+
+	for {
+		fmt.Print("\n👤 You: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			logError(err)
+		}
+
+		// Trim whitespace and newlines
+		question := strings.TrimSpace(input)
+
+		// Check for exit command
+		if strings.ToLower(question) == "exit" || strings.ToLower(question) == "quit" {
+			fmt.Println("\n👋 Goodbye!")
+			break
+		}
+
+		if question == "" {
+			continue
+		}
+
+		// Process the question and update chat history
+		chatHistory = processRagQuestionWithHistory(ctx, client, vectorStore, chatHistory, question)
+	}
+}
+
+// processRagQuestionWithHistory processes a question using RAG and maintains chat history
+func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vectorStore []VectorRecord,
+	history []api.Message, question string) []api.Message {
+
+	// Get embedding for the question
 	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, client, question)
 	if err != nil {
 		logError(err)
 	}
 
-	// Search similarites between the question and the vectors of the store
-	// 1- calculate the cosine similarity between the question and each vector in the store
-	similarities := []Similarity{}
+	// Find similarities and retrieve relevant context
+	newContext := findRelevantContext(vectorStore, embeddingFromQuestion)
 
-	for _, vector := range vectorStore {
-		cosineSimilarity, err := CosineSimilarity(embeddingFromQuestion, vector.Embedding)
-		if err != nil {
-			logError(err)
+	// Add the new question to history
+	history = append(history, api.Message{Role: "user", Content: question})
+
+	// Add context as a system message just before generating the response
+	contextMessage := api.Message{Role: "system", Content: "CONTENT:\n" + newContext}
+
+	// Create a copy of history with context inserted before the user's question
+	augmentedHistory := make([]api.Message, 0, len(history)+1)
+
+	// Add all system messages first
+	for _, msg := range history {
+		if msg.Role == "system" {
+			augmentedHistory = append(augmentedHistory, msg)
 		}
-
-		// append to similarities
-		similarities = append(similarities, Similarity{
-			Prompt:           vector.Prompt,
-			CosineSimilarity: cosineSimilarity,
-		})
 	}
 
-	// Select the 5 most similar chunks
-	// retrieve in similarities the 5 records with the highest cosine similarity
-	// sort the similarities
-	sort.Slice(similarities, func(i, j int) bool {
-		return similarities[i].CosineSimilarity > similarities[j].CosineSimilarity
+	// Add RAG context
+	augmentedHistory = append(augmentedHistory, contextMessage)
+
+	// Add non-system messages
+	for _, msg := range history {
+		if msg.Role != "system" {
+			augmentedHistory = append(augmentedHistory, msg)
+		}
+	}
+
+	req := &api.ChatRequest{
+		Model:    "llama3.2",
+		Messages: augmentedHistory,
+		Options: map[string]interface{}{
+			"temperature":    0.0,
+			"repeat_last_n":  2,
+			"repeat_penalty": 1.8,
+			"top_k":          10,
+			"top_p":          0.5,
+		},
+		Stream: &TRUE,
+	}
+
+	fmt.Print("\n🤖 Assistant: ")
+
+	var responseContent strings.Builder
+	err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
+		fmt.Print(resp.Message.Content)
+		responseContent.WriteString(resp.Message.Content)
+		return nil
 	})
 
-	// get the first 5 records
-	// top5Similarities := similarities[:5]
-	top5Similarities := similarities
+	if err != nil {
+		logError(err)
+	}
+	fmt.Println()
 
-	fmt.Println("🔍 Top 5 similarities:")
-	for _, similarity := range top5Similarities {
-		fmt.Println("🔍 Prompt:", similarity.Prompt)
-		fmt.Println("🔍 Cosine similarity:", similarity.CosineSimilarity)
-		fmt.Println("--------------------------------------------------")
+	// Add the assistant's response to the history
+	history = append(history, api.Message{Role: "assistant", Content: responseContent.String()})
 
+	return history
+}
+
+// processRagQuestion processes a single question with RAG (no history tracking)
+func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []VectorRecord,
+	systemInstructions string, question string) {
+
+	// Get embedding for the question
+	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, client, question)
+	if err != nil {
+		logError(err)
 	}
 
-	// Create a new context with the top 5 chunks
-	newContext := ""
-	for _, similarity := range top5Similarities {
-		newContext += similarity.Prompt
-	}
-
-	// Answer the question with the new context
+	// Find similarities and retrieve relevant context
+	newContext := findRelevantContext(vectorStore, embeddingFromQuestion)
 
 	// Prompt construction
 	messages := []api.Message{
@@ -160,7 +270,6 @@ func main() {
 	}
 
 	req := &api.ChatRequest{
-		// Model:    "qwen2.5:0.5b",
 		Model:    "llama3.2",
 		Messages: messages,
 		Options: map[string]interface{}{
@@ -185,6 +294,48 @@ func main() {
 	}
 	fmt.Println()
 	fmt.Println()
+}
+
+// findRelevantContext finds the most relevant context chunks for a question
+func findRelevantContext(vectorStore []VectorRecord, questionEmbedding []float64) string {
+	// Calculate cosine similarity between the question and each vector in the store
+	similarities := []Similarity{}
+
+	for _, vector := range vectorStore {
+		cosineSimilarity, err := CosineSimilarity(questionEmbedding, vector.Embedding)
+		if err != nil {
+			logError(err)
+		}
+
+		// append to similarities
+		similarities = append(similarities, Similarity{
+			Prompt:           vector.Prompt,
+			CosineSimilarity: cosineSimilarity,
+		})
+	}
+
+	// Sort the similarities by cosine similarity
+	sort.Slice(similarities, func(i, j int) bool {
+		return similarities[i].CosineSimilarity > similarities[j].CosineSimilarity
+	})
+
+	// Take all similarities for now
+	topSimilarities := similarities
+
+	// Debug information
+	fmt.Println("🔍 Top similarities:")
+	for i, similarity := range topSimilarities {
+		fmt.Printf("🔍 [%d] Similarity: %.4f\n", i+1, similarity.CosineSimilarity)
+		fmt.Println("--------------------------------------------------")
+	}
+
+	// Create a context with the top chunks
+	newContext := ""
+	for _, similarity := range topSimilarities {
+		newContext += similarity.Prompt
+	}
+
+	return newContext
 }
 
 func ChunkText(text string, chunkSize, overlap int) []string {
