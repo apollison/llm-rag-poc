@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -25,9 +26,17 @@ func logError(err error) {
 	log.Fatalf("😡 %s:%d - %v", file, line, err)
 }
 
+// logDebug prints debug information only when debug mode is enabled
+func logDebug(format string, args ...interface{}) {
+	if debugMode {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
 var (
-	FALSE = false
-	TRUE  = true
+	FALSE     = false
+	TRUE      = true
+	debugMode = false // Global debug flag
 )
 
 // System instructions used across all modes
@@ -40,7 +49,11 @@ You specialize in the wheel strategy and options trading.`
 func main() {
 	// Parse command-line flags
 	interactive := flag.Bool("interactive", false, "Run in interactive chat mode")
+	debug := flag.Bool("debug", false, "Enable debug output")
 	flag.Parse()
+
+	// Set the global debug mode
+	debugMode = *debug
 
 	ctx := context.Background()
 
@@ -78,17 +91,17 @@ func setupOllamaClient() *api.Client {
 	client := api.NewClient(ollamaUrl, httpClient)
 
 	// Verify Ollama server is running
-	fmt.Printf("🔄 Connecting to Ollama server at %s\n", ollamaRawUrl)
+	logDebug("🔄 Connecting to Ollama server at %s", ollamaRawUrl)
 	resp, err := http.Get(ollamaRawUrl + "/api/tags")
 	if err != nil {
-		fmt.Printf("⚠️ Warning: Ollama server might not be running at %s\n", ollamaRawUrl)
-		fmt.Printf("⚠️ Error: %v\n", err)
-		fmt.Println("⚠️ Make sure the Ollama server is running before continuing.")
+		logDebug("⚠️ Warning: Ollama server might not be running at %s", ollamaRawUrl)
+		logDebug("⚠️ Error: %v", err)
+		logDebug("⚠️ Make sure the Ollama server is running before continuing.")
 		// We'll exit with a meaningful error message
 		logError(fmt.Errorf("cannot connect to Ollama server at %s: %w", ollamaRawUrl, err))
 	} else {
 		resp.Body.Close() // Clean up the response
-		fmt.Println("✅ Successfully connected to Ollama server")
+		logDebug("✅ Successfully connected to Ollama server")
 	}
 
 	return client
@@ -96,22 +109,49 @@ func setupOllamaClient() *api.Client {
 
 // setupKnowledgeBase loads and embeds the content for RAG
 func setupKnowledgeBase(ctx context.Context, client *api.Client) []VectorRecord {
-	contentBytes, err := os.ReadFile("../../content/stonks.md")
+	// Define the root content directory
+	contentDir := "../../content"
+
+	// Get all content files recursively
+	contentFiles, err := getAllContentFiles(contentDir)
 	if err != nil {
-		logError(err)
+		logError(fmt.Errorf("error finding content files: %w", err))
 	}
-	content := string(contentBytes)
-	fmt.Printf("📄 Content size: %d bytes\n", len(content))
+
+	logDebug("📚 Found %d content files to process", len(contentFiles))
+
+	// Collect content from all files
+	var allContent strings.Builder
+
+	for _, filePath := range contentFiles {
+		contentBytes, err := os.ReadFile(filePath)
+		if err != nil {
+			logDebug("⚠️ Error reading file %s: %v", filePath, err)
+			continue
+		}
+
+		// Add metadata header to identify the source file
+		relPath, _ := filepath.Rel(contentDir, filePath)
+		header := fmt.Sprintf("\n# SOURCE: %s\n\n", relPath)
+		allContent.WriteString(header)
+		allContent.Write(contentBytes)
+		allContent.WriteString("\n\n")
+
+		logDebug("📄 Loaded content from: %s (%d bytes)", relPath, len(contentBytes))
+	}
+
+	content := allContent.String()
+	logDebug("📄 Total content size: %d bytes", len(content))
 
 	// Use smaller chunks with less overlap to prevent embedding issues
 	// Maximum recommended size for embedding is around 512 tokens (roughly 2048 chars)
 	chunks := ChunkText(content, 400, 50)
-	fmt.Printf("🧩 Split content into %d chunks\n", len(chunks))
+	logDebug("🧩 Split content into %d chunks", len(chunks))
 
 	vectorStore := []VectorRecord{}
 	// Create embeddings from documents and save them in the store
 	for idx, chunk := range chunks {
-		fmt.Printf("📝 Creating embedding nb: %d (size: %d chars)\n", idx, len(chunk))
+		logDebug("📝 Creating embedding nb: %d (size: %d chars)", idx, len(chunk))
 
 		// Use SafeGetEmbeddingFromChunk which handles large text better
 		embedding, err := SafeGetEmbeddingFromChunk(ctx, client, chunk)
@@ -130,11 +170,35 @@ func setupKnowledgeBase(ctx context.Context, client *api.Client) []VectorRecord 
 	return vectorStore
 }
 
+// getAllContentFiles recursively finds all content files in a directory
+func getAllContentFiles(rootDir string) ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Filter for markdown files
+		if filepath.Ext(path) == ".md" {
+			files = append(files, path)
+		}
+
+		return nil
+	})
+
+	return files, err
+}
+
 // runSingleQuestionMode processes a single predefined question
 func runSingleQuestionMode(ctx context.Context, client *api.Client, vectorStore []VectorRecord) {
-	question := `based on the AAPL option chain, which option should I sell to open?
-	I want to start the wheel strategy.
-	I do not have any positions on AAPL.
+	question := `Based on my portfolio and AAPL option chain data, which option should I sell to open?
+	I want to follow the wheel strategy and tasty trade principles.
 	`
 
 	// Process the question with RAG
@@ -148,11 +212,13 @@ func runInteractiveMode(ctx context.Context, client *api.Client, vectorStore []V
 		{Role: "system", Content: SYSTEM_INSTRUCTIONS},
 	}
 
+	// Always display welcome messages in interactive mode
 	fmt.Println("\n🤖 Welcome to the interactive RAG chat mode!")
 	fmt.Println("📊 Ask me any questions about stocks and options trading.")
 	fmt.Println("💡 Type 'exit' or 'quit' to end the session.")
 
 	for {
+		// Always display prompt for user input
 		fmt.Print("\n👤 You: ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -229,10 +295,12 @@ func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vect
 		Stream: &TRUE,
 	}
 
+	// Always show the assistant prompt in interactive mode
 	fmt.Print("\n🤖 Assistant: ")
 
 	var responseContent strings.Builder
 	err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
+		// Always display the assistant's response
 		fmt.Print(resp.Message.Content)
 		responseContent.WriteString(resp.Message.Content)
 		return nil
@@ -282,9 +350,12 @@ func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []V
 		Stream: &TRUE,
 	}
 
-	fmt.Println("🦄 question:", question)
-	fmt.Println("🤖 answer:")
+	// Question should be visible in all modes
+	fmt.Println("🦄 Question:", question)
+	fmt.Println("🤖 Answer:")
+
 	err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
+		// Response should always be visible, regardless of debug mode
 		fmt.Print(resp.Message.Content)
 		return nil
 	})
@@ -292,8 +363,7 @@ func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []V
 	if err != nil {
 		logError(err)
 	}
-	fmt.Println()
-	fmt.Println()
+	fmt.Println("\n")
 }
 
 // findRelevantContext finds the most relevant context chunks for a question
@@ -323,10 +393,10 @@ func findRelevantContext(vectorStore []VectorRecord, questionEmbedding []float64
 	topSimilarities := similarities
 
 	// Debug information
-	fmt.Println("🔍 Top similarities:")
+	logDebug("🔍 Top similarities:")
 	for i, similarity := range topSimilarities {
-		fmt.Printf("🔍 [%d] Similarity: %.4f\n", i+1, similarity.CosineSimilarity)
-		fmt.Println("--------------------------------------------------")
+		logDebug("🔍 [%d] Similarity: %.4f", i+1, similarity.CosineSimilarity)
+		logDebug("--------------------------------------------------")
 	}
 
 	// Create a context with the top chunks
@@ -381,17 +451,17 @@ func GetEmbeddingFromChunk(ctx context.Context, client *api.Client, doc string) 
 		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
-		fmt.Printf("🔄 Embedding attempt %d/%d...\n", attempts+1, maxRetries)
+		logDebug("🔄 Embedding attempt %d/%d...", attempts+1, maxRetries)
 		resp, err = client.Embeddings(reqCtx, req)
 
 		if err == nil {
-			fmt.Println("✅ Embedding request successful")
+			logDebug("✅ Embedding request successful")
 			return resp.Embedding, nil
 		}
 
 		lastErr = err
 		retryDelay := time.Duration(math.Pow(2, float64(attempts))) * baseDelay
-		fmt.Printf("⚠️ Attempt %d/%d failed: %v (retrying in %v)\n",
+		logDebug("⚠️ Attempt %d/%d failed: %v (retrying in %v)",
 			attempts+1, maxRetries, err, retryDelay)
 		time.Sleep(retryDelay)
 	}
@@ -406,7 +476,7 @@ func SafeGetEmbeddingFromChunk(ctx context.Context, client *api.Client, doc stri
 	maxSize := 2048
 	if len(doc) > maxSize {
 		doc = doc[:maxSize]
-		fmt.Printf("⚠️ Document truncated to %d characters\n", maxSize)
+		logDebug("⚠️ Document truncated to %d characters", maxSize)
 	}
 	return GetEmbeddingFromChunk(ctx, client, doc)
 }
