@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -11,13 +10,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/ollama/ollama/api"
+	qdrantclient "github.com/qdrant/go-client/qdrant"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // logError logs an error with file and line information
@@ -39,6 +39,13 @@ var (
 	debugMode = false // Global debug flag
 )
 
+const (
+	// Collection name for our RAG data in Qdrant
+	COLLECTION_NAME = "stonks_rag"
+	// Limit for similarity search results
+	SEARCH_LIMIT = 10
+)
+
 // System instructions used across all modes
 const SYSTEM_INSTRUCTIONS = `You are a helpful assistant.
 You offer stock and option trading advice.
@@ -50,6 +57,8 @@ func main() {
 	// Parse command-line flags
 	interactive := flag.Bool("interactive", false, "Run in interactive chat mode")
 	debug := flag.Bool("debug", false, "Enable debug output")
+	qdrantHost := flag.String("qdrant-host", "localhost", "Qdrant server host")
+	qdrantPort := flag.Int("qdrant-port", 6334, "Qdrant server gRPC port")
 	flag.Parse()
 
 	// Set the global debug mode
@@ -57,17 +66,61 @@ func main() {
 
 	ctx := context.Background()
 
-	// Set up Ollama client
-	client := setupOllamaClient()
+	// Connect to Qdrant
+	qdrantClient, err := connectToQdrant(*qdrantHost, *qdrantPort)
+	if err != nil {
+		logError(fmt.Errorf("failed to connect to Qdrant: %w", err))
+	}
+	logDebug("✅ Connected to Qdrant at %s:%d", *qdrantHost, *qdrantPort)
 
-	// Load and prepare knowledge base
-	vectorStore := setupKnowledgeBase(ctx, client)
+	// Verify Qdrant collection exists
+	if err := verifyQdrantCollection(ctx, qdrantClient); err != nil {
+		logError(fmt.Errorf("Qdrant collection issue: %w. Did you run the indexer first?", err))
+	}
+
+	// Set up Ollama client for embedding queries
+	ollamaClient := setupOllamaClient()
 
 	if *interactive {
-		runInteractiveMode(ctx, client, vectorStore)
+		runInteractiveMode(ctx, ollamaClient, qdrantClient)
 	} else {
-		runSingleQuestionMode(ctx, client, vectorStore)
+		runSingleQuestionMode(ctx, ollamaClient, qdrantClient)
 	}
+}
+
+// connectToQdrant establishes a connection to the Qdrant server
+func connectToQdrant(host string, port int) (qdrantclient.CollectionsClient, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Qdrant at %s: %w", addr, err)
+	}
+
+	return qdrantclient.NewCollectionsClient(conn), nil
+}
+
+// verifyQdrantCollection checks if the required collection exists in Qdrant
+func verifyQdrantCollection(ctx context.Context, client qdrantclient.CollectionsClient) error {
+	req := &qdrantclient.ListCollectionsRequest{}
+	collections, err := client.List(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to list collections: %w", err)
+	}
+
+	exists := false
+	for _, col := range collections.GetCollections() {
+		if col.GetName() == COLLECTION_NAME {
+			exists = true
+			break
+		}
+	}
+
+	if !exists {
+		return fmt.Errorf("collection '%s' does not exist", COLLECTION_NAME)
+	}
+
+	logDebug("✅ Verified Qdrant collection '%s' exists", COLLECTION_NAME)
+	return nil
 }
 
 // setupOllamaClient configures and tests the Ollama API client
@@ -107,106 +160,18 @@ func setupOllamaClient() *api.Client {
 	return client
 }
 
-// setupKnowledgeBase loads and embeds the content for RAG
-func setupKnowledgeBase(ctx context.Context, client *api.Client) []VectorRecord {
-	// Define the root content directory
-	contentDir := "../../content"
-
-	// Get all content files recursively
-	contentFiles, err := getAllContentFiles(contentDir)
-	if err != nil {
-		logError(fmt.Errorf("error finding content files: %w", err))
-	}
-
-	logDebug("📚 Found %d content files to process", len(contentFiles))
-
-	// Collect content from all files
-	var allContent strings.Builder
-
-	for _, filePath := range contentFiles {
-		contentBytes, err := os.ReadFile(filePath)
-		if err != nil {
-			logDebug("⚠️ Error reading file %s: %v", filePath, err)
-			continue
-		}
-
-		// Add metadata header to identify the source file
-		relPath, _ := filepath.Rel(contentDir, filePath)
-		header := fmt.Sprintf("\n# SOURCE: %s\n\n", relPath)
-		allContent.WriteString(header)
-		allContent.Write(contentBytes)
-		allContent.WriteString("\n\n")
-
-		logDebug("📄 Loaded content from: %s (%d bytes)", relPath, len(contentBytes))
-	}
-
-	content := allContent.String()
-	logDebug("📄 Total content size: %d bytes", len(content))
-
-	// Use smaller chunks with less overlap to prevent embedding issues
-	// Maximum recommended size for embedding is around 512 tokens (roughly 2048 chars)
-	chunks := ChunkText(content, 400, 50)
-	logDebug("🧩 Split content into %d chunks", len(chunks))
-
-	vectorStore := []VectorRecord{}
-	// Create embeddings from documents and save them in the store
-	for idx, chunk := range chunks {
-		logDebug("📝 Creating embedding nb: %d (size: %d chars)", idx, len(chunk))
-
-		// Use SafeGetEmbeddingFromChunk which handles large text better
-		embedding, err := SafeGetEmbeddingFromChunk(ctx, client, chunk)
-		if err != nil {
-			logError(err)
-		}
-
-		// Save the embedding in the vector store
-		record := VectorRecord{
-			Prompt:    chunk,
-			Embedding: embedding,
-		}
-		vectorStore = append(vectorStore, record)
-	}
-
-	return vectorStore
-}
-
-// getAllContentFiles recursively finds all content files in a directory
-func getAllContentFiles(rootDir string) ([]string, error) {
-	var files []string
-
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-
-		// Filter for markdown files
-		if filepath.Ext(path) == ".md" {
-			files = append(files, path)
-		}
-
-		return nil
-	})
-
-	return files, err
-}
-
 // runSingleQuestionMode processes a single predefined question
-func runSingleQuestionMode(ctx context.Context, client *api.Client, vectorStore []VectorRecord) {
+func runSingleQuestionMode(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient) {
 	question := `Based on my portfolio and AAPL option chain data, which option should I sell to open?
 	I want to follow the wheel strategy and tasty trade principles.
 	`
 
 	// Process the question with RAG
-	processRagQuestion(ctx, client, vectorStore, SYSTEM_INSTRUCTIONS, question)
+	processRagQuestion(ctx, ollamaClient, qdrantClient, SYSTEM_INSTRUCTIONS, question)
 }
 
 // runInteractiveMode runs an interactive chat session
-func runInteractiveMode(ctx context.Context, client *api.Client, vectorStore []VectorRecord) {
+func runInteractiveMode(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient) {
 	reader := bufio.NewReader(os.Stdin)
 	chatHistory := []api.Message{
 		{Role: "system", Content: SYSTEM_INSTRUCTIONS},
@@ -239,22 +204,25 @@ func runInteractiveMode(ctx context.Context, client *api.Client, vectorStore []V
 		}
 
 		// Process the question and update chat history
-		chatHistory = processRagQuestionWithHistory(ctx, client, vectorStore, chatHistory, question)
+		chatHistory = processRagQuestionWithHistory(ctx, ollamaClient, qdrantClient, chatHistory, question)
 	}
 }
 
 // processRagQuestionWithHistory processes a question using RAG and maintains chat history
-func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vectorStore []VectorRecord,
+func processRagQuestionWithHistory(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient,
 	history []api.Message, question string) []api.Message {
 
 	// Get embedding for the question
-	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, client, question)
+	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, ollamaClient, question)
 	if err != nil {
 		logError(err)
 	}
 
-	// Find similarities and retrieve relevant context
-	newContext := findRelevantContext(vectorStore, embeddingFromQuestion)
+	// Find similar documents from Qdrant
+	newContext, err := findRelevantContextFromQdrant(ctx, qdrantClient, embeddingFromQuestion)
+	if err != nil {
+		logError(err)
+	}
 
 	// Add the new question to history
 	history = append(history, api.Message{Role: "user", Content: question})
@@ -262,20 +230,17 @@ func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vect
 	// Add context as a system message just before generating the response
 	contextMessage := api.Message{Role: "system", Content: "CONTENT:\n" + newContext}
 
-	// Create a copy of history with context inserted before the user's question
-	augmentedHistory := make([]api.Message, 0, len(history)+1)
-
-	// Add all system messages first
-	for _, msg := range history {
-		if msg.Role == "system" {
-			augmentedHistory = append(augmentedHistory, msg)
-		}
+	// Create a new slice for the messages to send to the LLM
+	// We'll structure it similar to single question mode for consistency
+	augmentedHistory := []api.Message{
+		// Always include the system instructions first for consistent behavior
+		{Role: "system", Content: SYSTEM_INSTRUCTIONS},
+		// Add RAG context second
+		contextMessage,
 	}
 
-	// Add RAG context
-	augmentedHistory = append(augmentedHistory, contextMessage)
-
-	// Add non-system messages
+	// Add conversation history (only user and assistant messages)
+	// This preserves chat continuity while maintaining the system instructions priority
 	for _, msg := range history {
 		if msg.Role != "system" {
 			augmentedHistory = append(augmentedHistory, msg)
@@ -299,7 +264,7 @@ func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vect
 	fmt.Print("\n🤖 Assistant: ")
 
 	var responseContent strings.Builder
-	err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
+	err = ollamaClient.Chat(ctx, req, func(resp api.ChatResponse) error {
 		// Always display the assistant's response
 		fmt.Print(resp.Message.Content)
 		responseContent.WriteString(resp.Message.Content)
@@ -318,17 +283,20 @@ func processRagQuestionWithHistory(ctx context.Context, client *api.Client, vect
 }
 
 // processRagQuestion processes a single question with RAG (no history tracking)
-func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []VectorRecord,
+func processRagQuestion(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient,
 	systemInstructions string, question string) {
 
 	// Get embedding for the question
-	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, client, question)
+	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, ollamaClient, question)
 	if err != nil {
 		logError(err)
 	}
 
-	// Find similarities and retrieve relevant context
-	newContext := findRelevantContext(vectorStore, embeddingFromQuestion)
+	// Find similar documents from Qdrant
+	newContext, err := findRelevantContextFromQdrant(ctx, qdrantClient, embeddingFromQuestion)
+	if err != nil {
+		logError(err)
+	}
 
 	// Prompt construction
 	messages := []api.Message{
@@ -354,7 +322,7 @@ func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []V
 	fmt.Println("🦄 Question:", question)
 	fmt.Println("🤖 Answer:")
 
-	err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
+	err = ollamaClient.Chat(ctx, req, func(resp api.ChatResponse) error {
 		// Response should always be visible, regardless of debug mode
 		fmt.Print(resp.Message.Content)
 		return nil
@@ -363,75 +331,101 @@ func processRagQuestion(ctx context.Context, client *api.Client, vectorStore []V
 	if err != nil {
 		logError(err)
 	}
-	fmt.Println("\n")
+	fmt.Println()
 }
 
-// findRelevantContext finds the most relevant context chunks for a question
-func findRelevantContext(vectorStore []VectorRecord, questionEmbedding []float64) string {
-	// Calculate cosine similarity between the question and each vector in the store
-	similarities := []Similarity{}
-
-	for _, vector := range vectorStore {
-		cosineSimilarity, err := CosineSimilarity(questionEmbedding, vector.Embedding)
+// findRelevantContextFromQdrant queries Qdrant for relevant context based on embeddings
+func findRelevantContextFromQdrant(ctx context.Context, client qdrantclient.CollectionsClient, embedding []float64) (string, error) {
+	// Get a points client for vector search
+	// Since we can't directly access the connection, create a new connection with same params
+	conn, ok := client.(interface {
+		GetConnection() grpc.ClientConnInterface
+	})
+	if !ok {
+		// If we can't get the connection from the client, create new one with host/port
+		// This is a fallback that assumes standard connection params (localhost:6334)
+		newConn, err := grpc.Dial("localhost:6334", grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			logError(err)
+			return "", fmt.Errorf("failed to create new connection to Qdrant: %w", err)
 		}
-
-		// append to similarities
-		similarities = append(similarities, Similarity{
-			Prompt:           vector.Prompt,
-			CosineSimilarity: cosineSimilarity,
-		})
+		pointsClient := qdrantclient.NewPointsClient(newConn)
+		return searchInQdrant(ctx, pointsClient, embedding)
 	}
 
-	// Sort the similarities by cosine similarity
-	sort.Slice(similarities, func(i, j int) bool {
-		return similarities[i].CosineSimilarity > similarities[j].CosineSimilarity
-	})
+	pointsClient := qdrantclient.NewPointsClient(conn.GetConnection())
+	return searchInQdrant(ctx, pointsClient, embedding)
+}
 
-	// Take all similarities for now
-	topSimilarities := similarities
+// searchInQdrant performs the actual similarity search in Qdrant
+func searchInQdrant(ctx context.Context, client qdrantclient.PointsClient, embedding []float64) (string, error) {
+	// Convert the embedding to Qdrant vector format
+	vector := make([]float32, len(embedding))
+	for i, val := range embedding {
+		vector[i] = float32(val)
+	}
+
+	// Search for similar vectors in Qdrant
+	searchReq := &qdrantclient.SearchPoints{
+		CollectionName: COLLECTION_NAME,
+		Vector:         vector,
+		Limit:          uint64(SEARCH_LIMIT),
+		WithPayload: &qdrantclient.WithPayloadSelector{
+			SelectorOptions: &qdrantclient.WithPayloadSelector_Include{
+				Include: &qdrantclient.PayloadIncludeSelector{
+					Fields: []string{"text", "source"},
+				},
+			},
+		},
+	}
+
+	searchResp, err := client.Search(ctx, searchReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to search in Qdrant: %w", err)
+	}
+
+	if len(searchResp.Result) == 0 {
+		return "No relevant information found.", nil
+	}
 
 	// Debug information
-	logDebug("🔍 Top similarities:")
-	for i, similarity := range topSimilarities {
-		logDebug("🔍 [%d] Similarity: %.4f", i+1, similarity.CosineSimilarity)
-		logDebug("--------------------------------------------------")
-	}
+	logDebug("🔍 Found %d relevant chunks in Qdrant", len(searchResp.Result))
 
-	// Create a context with the top chunks
-	newContext := ""
-	for _, similarity := range topSimilarities {
-		newContext += similarity.Prompt
-	}
+	// Combine relevant chunks into a single context
+	var contextBuilder strings.Builder
 
-	return newContext
-}
+	for i, point := range searchResp.Result {
+		score := point.GetScore()
+		source := ""
+		text := ""
 
-func ChunkText(text string, chunkSize, overlap int) []string {
-	chunks := []string{}
-	for start := 0; start < len(text); start += chunkSize - overlap {
-		end := start + chunkSize
-		if end > len(text) {
-			end = len(text)
+		if sourceVal, ok := point.Payload["source"]; ok {
+			source = sourceVal.GetStringValue()
 		}
-		chunks = append(chunks, text[start:end])
+
+		if textVal, ok := point.Payload["text"]; ok {
+			text = textVal.GetStringValue()
+		}
+
+		logDebug("🔍 [%d] Source: %s, Score: %.4f", i+1, source, score)
+
+		// Add source information to the context
+		if source != "" {
+			contextBuilder.WriteString(fmt.Sprintf("# SOURCE: %s\n\n", source))
+		}
+
+		// Add the text content
+		contextBuilder.WriteString(text)
+		contextBuilder.WriteString("\n\n")
 	}
-	return chunks
+
+	return contextBuilder.String(), nil
 }
 
-type VectorRecord struct {
-	Prompt    string    `json:"prompt"`
-	Embedding []float64 `json:"embedding"`
-}
-
-type Similarity struct {
-	Prompt           string
-	CosineSimilarity float64
-}
-
+// GetEmbeddingFromChunk gets an embedding vector for a text chunk
 func GetEmbeddingFromChunk(ctx context.Context, client *api.Client, doc string) ([]float64, error) {
-	embeddingsModel := "snowflake-arctic-embed:33m"
+	// Use llama3 as it's more commonly available on Ollama installations
+	// This model should be consistent with what was used in the indexer
+	embeddingsModel := "llama3"
 
 	req := &api.EmbeddingRequest{
 		Model:  embeddingsModel,
@@ -479,36 +473,4 @@ func SafeGetEmbeddingFromChunk(ctx context.Context, client *api.Client, doc stri
 		logDebug("⚠️ Document truncated to %d characters", maxSize)
 	}
 	return GetEmbeddingFromChunk(ctx, client, doc)
-}
-
-// CosineSimilarity calculates the cosine similarity between two vectors
-// Returns a value between -1 and 1, where:
-// 1 means vectors are identical
-// 0 means vectors are perpendicular
-// -1 means vectors are opposite
-func CosineSimilarity(vec1, vec2 []float64) (float64, error) {
-	if len(vec1) != len(vec2) {
-		return 0, errors.New("vectors must have the same length")
-	}
-
-	// Calculate dot product
-	dotProduct := 0.0
-	magnitude1 := 0.0
-	magnitude2 := 0.0
-
-	for i := 0; i < len(vec1); i++ {
-		dotProduct += vec1[i] * vec2[i]
-		magnitude1 += vec1[i] * vec1[i]
-		magnitude2 += vec2[i] * vec2[i]
-	}
-
-	magnitude1 = math.Sqrt(magnitude1)
-	magnitude2 = math.Sqrt(magnitude2)
-
-	// Check for zero magnitudes to avoid division by zero
-	if magnitude1 == 0 || magnitude2 == 0 {
-		return 0, errors.New("vector magnitude cannot be zero")
-	}
-
-	return dotProduct / (magnitude1 * magnitude2), nil
 }
