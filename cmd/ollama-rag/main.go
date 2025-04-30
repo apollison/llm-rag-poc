@@ -167,7 +167,7 @@ func runSingleQuestionMode(ctx context.Context, ollamaClient *api.Client, qdrant
 	`
 
 	// Process the question with RAG
-	processRagQuestion(ctx, ollamaClient, qdrantClient, SYSTEM_INSTRUCTIONS, question)
+	processRagQuestion(ctx, ollamaClient, qdrantClient, SYSTEM_INSTRUCTIONS, question, nil, false)
 }
 
 // runInteractiveMode runs an interactive chat session
@@ -204,13 +204,16 @@ func runInteractiveMode(ctx context.Context, ollamaClient *api.Client, qdrantCli
 		}
 
 		// Process the question and update chat history
-		chatHistory = processRagQuestionWithHistory(ctx, ollamaClient, qdrantClient, chatHistory, question)
+		response := processRagQuestion(ctx, ollamaClient, qdrantClient, SYSTEM_INSTRUCTIONS, question, chatHistory, true)
+		chatHistory = append(chatHistory, api.Message{Role: "user", Content: question})
+		chatHistory = append(chatHistory, api.Message{Role: "assistant", Content: response})
 	}
 }
 
-// processRagQuestionWithHistory processes a question using RAG and maintains chat history
-func processRagQuestionWithHistory(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient,
-	history []api.Message, question string) []api.Message {
+// processRagQuestion processes a question with RAG and returns the response
+// It can be used in both single question mode and interactive mode
+func processRagQuestion(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient,
+	systemInstructions string, question string, messages []api.Message, interactive bool) string {
 
 	// Get embedding for the question
 	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, ollamaClient, question)
@@ -224,32 +227,36 @@ func processRagQuestionWithHistory(ctx context.Context, ollamaClient *api.Client
 		logError(err)
 	}
 
-	// Add the new question to history
-	history = append(history, api.Message{Role: "user", Content: question})
+	// If messages are provided, use them as the base (for interactive mode)
+	// Otherwise, create a fresh message array (for single question mode)
+	var finalMessages []api.Message
+	if messages != nil {
+		// Create a new slice for the messages to send to the LLM
+		finalMessages = []api.Message{
+			// Always include the system instructions first for consistent behavior
+			{Role: "system", Content: systemInstructions},
+			// Add RAG context second
+			{Role: "system", Content: "CONTENT:\n" + newContext},
+		}
 
-	// Add context as a system message just before generating the response
-	contextMessage := api.Message{Role: "system", Content: "CONTENT:\n" + newContext}
-
-	// Create a new slice for the messages to send to the LLM
-	// We'll structure it similar to single question mode for consistency
-	augmentedHistory := []api.Message{
-		// Always include the system instructions first for consistent behavior
-		{Role: "system", Content: SYSTEM_INSTRUCTIONS},
-		// Add RAG context second
-		contextMessage,
-	}
-
-	// Add conversation history (only user and assistant messages)
-	// This preserves chat continuity while maintaining the system instructions priority
-	for _, msg := range history {
-		if msg.Role != "system" {
-			augmentedHistory = append(augmentedHistory, msg)
+		// Add conversation history (only user and assistant messages)
+		for _, msg := range messages {
+			if msg.Role != "system" {
+				finalMessages = append(finalMessages, msg)
+			}
+		}
+	} else {
+		// For single question mode, use this simpler structure
+		finalMessages = []api.Message{
+			{Role: "system", Content: systemInstructions},
+			{Role: "system", Content: "CONTENT:\n" + newContext},
+			{Role: "user", Content: question},
 		}
 	}
 
 	req := &api.ChatRequest{
 		Model:    "llama3.2",
-		Messages: augmentedHistory,
+		Messages: finalMessages,
 		Options: map[string]interface{}{
 			"temperature":    0.0,
 			"repeat_last_n":  2,
@@ -260,12 +267,16 @@ func processRagQuestionWithHistory(ctx context.Context, ollamaClient *api.Client
 		Stream: &TRUE,
 	}
 
-	// Always show the assistant prompt in interactive mode
-	fmt.Print("\n🤖 Assistant: ")
+	// Output formatting depends on the mode
+	if !interactive {
+		fmt.Println("🦄 Question:", question)
+		fmt.Println("🤖 Answer:")
+	} else {
+		fmt.Print("\n🤖 Assistant: ")
+	}
 
 	var responseContent strings.Builder
 	err = ollamaClient.Chat(ctx, req, func(resp api.ChatResponse) error {
-		// Always display the assistant's response
 		fmt.Print(resp.Message.Content)
 		responseContent.WriteString(resp.Message.Content)
 		return nil
@@ -276,62 +287,7 @@ func processRagQuestionWithHistory(ctx context.Context, ollamaClient *api.Client
 	}
 	fmt.Println()
 
-	// Add the assistant's response to the history
-	history = append(history, api.Message{Role: "assistant", Content: responseContent.String()})
-
-	return history
-}
-
-// processRagQuestion processes a single question with RAG (no history tracking)
-func processRagQuestion(ctx context.Context, ollamaClient *api.Client, qdrantClient qdrantclient.CollectionsClient,
-	systemInstructions string, question string) {
-
-	// Get embedding for the question
-	embeddingFromQuestion, err := GetEmbeddingFromChunk(ctx, ollamaClient, question)
-	if err != nil {
-		logError(err)
-	}
-
-	// Find similar documents from Qdrant
-	newContext, err := findRelevantContextFromQdrant(ctx, qdrantClient, embeddingFromQuestion)
-	if err != nil {
-		logError(err)
-	}
-
-	// Prompt construction
-	messages := []api.Message{
-		{Role: "system", Content: systemInstructions},
-		{Role: "system", Content: "CONTENT:\n" + newContext},
-		{Role: "user", Content: question},
-	}
-
-	req := &api.ChatRequest{
-		Model:    "llama3.2",
-		Messages: messages,
-		Options: map[string]interface{}{
-			"temperature":    0.0,
-			"repeat_last_n":  2,
-			"repeat_penalty": 1.8,
-			"top_k":          10,
-			"top_p":          0.5,
-		},
-		Stream: &TRUE,
-	}
-
-	// Question should be visible in all modes
-	fmt.Println("🦄 Question:", question)
-	fmt.Println("🤖 Answer:")
-
-	err = ollamaClient.Chat(ctx, req, func(resp api.ChatResponse) error {
-		// Response should always be visible, regardless of debug mode
-		fmt.Print(resp.Message.Content)
-		return nil
-	})
-
-	if err != nil {
-		logError(err)
-	}
-	fmt.Println()
+	return responseContent.String()
 }
 
 // findRelevantContextFromQdrant queries Qdrant for relevant context based on embeddings
